@@ -25,6 +25,7 @@ import android.os.PersistableBundle;
 import android.os.PowerManager;
 import android.os.Registrant;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.telephony.CarrierConfigManager;
 import android.telephony.DisconnectCause;
 import android.telephony.PhoneNumberUtils;
@@ -707,7 +708,11 @@ public class GsmCdmaConnection extends Connection {
 
         if (Phone.DEBUG_PHONE) log("--dssds----"+mCnapName);
         mCnapNamePresentation = dc.namePresentation;
-        mNumberPresentation = dc.numberPresentation;
+
+        boolean connectedLineIdentification = SystemProperties.getBoolean("nos.unknown_number", true);
+        if (mIsIncoming || connectedLineIdentification) {
+            mNumberPresentation = dc.numberPresentation;
+        }
 
         if (newParent != mParent) {
             if (mParent != null) {

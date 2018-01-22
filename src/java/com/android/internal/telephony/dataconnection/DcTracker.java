@@ -3267,8 +3267,7 @@ public class DcTracker extends Handler {
             }
         }
 
-        IccRecords r = mIccRecords.get();
-        String operator = (r != null) ? r.getOperatorNumeric() : "";
+        String operator = mPhone.getOperatorNumeric();
 
         // This is a workaround for a bug (7305641) where we don't failover to other
         // suitable APNs if our preferred APN fails.  On prepaid ATT sims we need to
@@ -3291,7 +3290,7 @@ public class DcTracker extends Handler {
                     + " canSetPreferApn=" + mCanSetPreferApn
                     + " mPreferredApn=" + mPreferredApn
                     + " operator=" + operator + " radioTech=" + radioTech
-                    + " IccRecords r=" + r);
+                    + " IccRecords r=" + mIccRecords);
         }
 
         if (usePreferred && mCanSetPreferApn && mPreferredApn != null &&
@@ -3860,7 +3859,7 @@ public class DcTracker extends Handler {
             return;
         }
 
-        IccRecords newIccRecords = getUiccRecords(UiccController.APP_FAM_3GPP);
+        IccRecords newIccRecords = mPhone.getIccRecords();
 
         IccRecords r = mIccRecords.get();
         if (r != newIccRecords) {

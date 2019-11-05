@@ -70,6 +70,7 @@ import android.telephony.NetworkRegistrationInfo;
 import android.telephony.PhysicalChannelConfig;
 import android.telephony.Rlog;
 import android.telephony.ServiceState;
+import android.telephony.ServiceState.RilRadioTechnology;
 import android.telephony.SignalStrength;
 import android.telephony.SubscriptionInfo;
 import android.telephony.SubscriptionManager;
@@ -546,6 +547,7 @@ public class ServiceStateTracker extends Handler {
     private String mPrlVersion;
     private boolean mIsMinInfoReady = false;
     private boolean mIsEriTextLoaded = false;
+    private String mEriText;
     @UnsupportedAppUsage
     private boolean mIsSubscriptionFromRuim = false;
     private CdmaSubscriptionSourceManager mCdmaSSM;
@@ -1811,7 +1813,7 @@ public class ServiceStateTracker extends Handler {
                  * data roaming status. If TSB58 roaming indicator is not in the
                  * carrier-specified list of ERIs for home system then set roaming.
                  */
-                final int dataRat = mNewSS.getRilDataRadioTechnology();
+                final int dataRat = getRilDataRadioTechnologyForWwan(mNewSS);
                 if (ServiceState.isCdma(dataRat)) {
                     final boolean isVoiceInService =
                             (mNewSS.getVoiceRegState() == ServiceState.STATE_IN_SERVICE);
@@ -2390,6 +2392,11 @@ public class ServiceStateTracker extends Handler {
              */
             boolean roaming = (mGsmRoaming || mDataRoaming);
 
+            // for IWLAN case, data is home. Only check voice roaming.
+            if (mNewSS.getRilDataRadioTechnology() == ServiceState.RIL_RADIO_TECHNOLOGY_IWLAN) {
+                roaming = mGsmRoaming;
+            }
+
             if (mGsmRoaming && !isOperatorConsideredRoaming(mNewSS)
                     && (isSameNamedOperators(mNewSS) || isOperatorConsideredNonRoaming(mNewSS))) {
                 log("updateRoamingState: resource override set non roaming.isSameNamedOperators="
@@ -2625,10 +2632,8 @@ public class ServiceStateTracker extends Handler {
                 showPlmn = true;
 
                 // Force display no service
-                final boolean forceDisplayNoService = mPhone.getContext().getResources().getBoolean(
-                        com.android.internal.R.bool.config_display_no_service_when_sim_unready)
-                        && !mIsSimReady;
-                if (mEmergencyOnly && !forceDisplayNoService) {
+                final boolean forceDisplayNoService = shouldForceDisplayNoService() && !mIsSimReady;
+                if (!forceDisplayNoService && Phone.isEmergencyCallOnly()) {
                     // No service but emergency call allowed
                     plmn = Resources.getSystem().
                             getText(com.android.internal.R.string.emergency_calls_only).toString();
@@ -2736,6 +2741,28 @@ public class ServiceStateTracker extends Handler {
                 .setShowPlmn(showPlmn)
                 .build());
         log("updateSpnDisplayLegacy-");
+    }
+
+    /**
+     * Checks whether force to display "no service" to the user based on the current country.
+     *
+     * This method should only be used when SIM is unready.
+     *
+     * @return {@code True} if "no service" should be displayed.
+     */
+    public boolean shouldForceDisplayNoService() {
+        String[] countriesWithNoService = mPhone.getContext().getResources().getStringArray(
+                com.android.internal.R.array.config_display_no_service_when_sim_unready);
+        if (ArrayUtils.isEmpty(countriesWithNoService)) {
+            return false;
+        }
+        String currentCountry = mLocaleTracker.getCurrentCountry();
+        for (String country : countriesWithNoService) {
+            if (country.equalsIgnoreCase(currentCountry)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     protected void setPowerStateToDesired() {
@@ -2879,7 +2906,18 @@ public class ServiceStateTracker extends Handler {
             // Checking the Concurrent Service Supported flag first for all phone types.
             return true;
         } else if (mPhone.isPhoneTypeGsm()) {
-            return (mSS.getRilDataRadioTechnology() >= ServiceState.RIL_RADIO_TECHNOLOGY_UMTS);
+            int radioTechnology = mSS.getRilDataRadioTechnology();
+            // There are cases where we we would setup data connection even data is not yet
+            // attached. In these cases we check voice rat.
+            if (radioTechnology == ServiceState.RIL_RADIO_TECHNOLOGY_UNKNOWN
+                    && mSS.getDataRegState() != ServiceState.STATE_IN_SERVICE) {
+                radioTechnology = mSS.getRilVoiceRadioTechnology();
+            }
+            // Concurrent voice and data is not allowed for 2G technologies. It's allowed in other
+            // rats e.g. UMTS, LTE, etc.
+            return radioTechnology != ServiceState.RIL_RADIO_TECHNOLOGY_UNKNOWN
+                    && ServiceState.rilRadioTechnologyToAccessNetworkType(radioTechnology)
+                        != AccessNetworkType.GERAN;
         } else {
             return false;
         }
@@ -3086,6 +3124,11 @@ public class ServiceStateTracker extends Handler {
             }
         }
 
+        // Filter out per transport data RAT changes, only want to track changes based on
+        // transport preference changes (WWAN to WLAN, for example).
+        boolean hasDataTransportPreferenceChanged = !anyDataRatChanged
+                && (mSS.getRilDataRadioTechnology() != mNewSS.getRilDataRadioTechnology());
+
         boolean hasVoiceRegStateChanged =
                 mSS.getVoiceRegState() != mNewSS.getVoiceRegState();
 
@@ -3165,6 +3208,7 @@ public class ServiceStateTracker extends Handler {
                     + " hasDataRegStateChanged = " + hasDataRegStateChanged
                     + " hasRilVoiceRadioTechnologyChanged = " + hasRilVoiceRadioTechnologyChanged
                     + " hasRilDataRadioTechnologyChanged = " + hasRilDataRadioTechnologyChanged
+                    + " hasDataTransportPreferenceChanged = " + hasDataTransportPreferenceChanged
                     + " hasChanged = " + hasChanged
                     + " hasVoiceRoamingOn = " + hasVoiceRoamingOn
                     + " hasVoiceRoamingOff = " + hasVoiceRoamingOff
@@ -3260,9 +3304,17 @@ public class ServiceStateTracker extends Handler {
             setNotification(CS_REJECT_CAUSE_ENABLED);
         }
 
-        if (hasChanged) {
+        String eriText = mPhone.getCdmaEriText();
+        boolean hasEriChanged = !TextUtils.equals(mEriText, eriText);
+        mEriText = eriText;
+        // Trigger updateSpnDisplay when
+        // 1. Service state is changed.
+        // 2. phone type is Cdma or CdmaLte and ERI text has changed.
+        if (hasChanged || (!mPhone.isPhoneTypeGsm() && hasEriChanged)) {
             updateSpnDisplay();
+        }
 
+        if (hasChanged) {
             tm.setNetworkOperatorNameForPhone(mPhone.getPhoneId(), mSS.getOperatorAlpha());
             String operatorNumeric = mSS.getOperatorNumeric();
 
@@ -3340,7 +3392,10 @@ public class ServiceStateTracker extends Handler {
             }
 
             if (hasDataRegStateChanged.get(transport)
-                    || hasRilDataRadioTechnologyChanged.get(transport)) {
+                    || hasRilDataRadioTechnologyChanged.get(transport)
+                    // Update all transports if preference changed so that consumers can be notified
+                    // that ServiceState#getRilDataRadioTechnology has changed.
+                    || hasDataTransportPreferenceChanged) {
                 notifyDataRegStateRilRadioTechnologyChanged(transport);
                 mPhone.notifyDataConnection();
             }
@@ -5116,7 +5171,7 @@ public class ServiceStateTracker extends Handler {
         }
         final boolean isDataInService =
                 (currentServiceState.getDataRegState() == ServiceState.STATE_IN_SERVICE);
-        final int dataRegType = currentServiceState.getRilDataRadioTechnology();
+        final int dataRegType = getRilDataRadioTechnologyForWwan(currentServiceState);
         if (isDataInService) {
             if (!currentServiceState.getDataRoaming()) {
                 currentServiceState.setDataRoamingType(ServiceState.ROAMING_TYPE_NOT_ROAMING);
@@ -5223,6 +5278,10 @@ public class ServiceStateTracker extends Handler {
                     mNewSS.addNetworkRegistrationInfo(nri);
                 }
                 mNewSS.setOperatorAlphaLong(operator);
+                // Since it's in airplane mode, cellular must be out of service. The only possible
+                // transport for data to go through is the IWLAN transport. Setting this to true
+                // so that ServiceState.getDataNetworkType can report the right RAT.
+                mNewSS.setIwlanPreferred(true);
                 log("pollStateDone: mNewSS = " + mNewSS);
             }
             return;
@@ -5428,5 +5487,16 @@ public class ServiceStateTracker extends Handler {
             }
         }
         return operatorName;
+    }
+
+    @RilRadioTechnology
+    private static int getRilDataRadioTechnologyForWwan(ServiceState ss) {
+        NetworkRegistrationInfo regInfo = ss.getNetworkRegistrationInfo(
+                NetworkRegistrationInfo.DOMAIN_PS, AccessNetworkConstants.TRANSPORT_TYPE_WWAN);
+        int networkType = TelephonyManager.NETWORK_TYPE_UNKNOWN;
+        if (regInfo != null) {
+            networkType = regInfo.getAccessNetworkTechnology();
+        }
+        return ServiceState.networkTypeToRilRadioTechnology(networkType);
     }
 }
